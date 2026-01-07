@@ -2,9 +2,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import crypto from "crypto";
-import { createClient } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
-
+export const runtime = "nodejs";
 /* ================= CONFIG ================= */
 const BATCH_SIZE = 100;
 const MAX_BATCHES = 5;
