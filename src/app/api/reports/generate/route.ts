@@ -2,26 +2,29 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import crypto from "crypto";
+import axios from "axios";
 import { supabase } from "@/lib/supabase";
+
 export const runtime = "nodejs";
+
 /* ================= CONFIG ================= */
-const BATCH_SIZE = 100;
-const MAX_BATCHES = 5;
+const BATCH_SIZE = 50;
+const MAX_BATCHES = 3;
 const ALLOWED_LIMITS = [10, 20, 40, 100];
 const PROMPT_VERSION = "v1";
 const DEBUG = process.env.NODE_ENV !== "production";
 
-const HIGH_SIGNAL_FLAIRS = [
-  "Hiring",
-  "Question",
-  "Discussion",
-  "Advice",
-];
+const HIGH_SIGNAL_FLAIRS = ["Hiring", "Question", "Discussion", "Advice"];
+
+const REDDIT_HEADERS = {
+  "User-Agent":
+    "web:RedditSignal:v1.0 (contact: support@redditsignal.com)",
+  Accept: "application/json",
+};
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 });
-
 
 function log(...args: any[]) {
   if (DEBUG) console.log("[reddit-signal]", ...args);
@@ -36,10 +39,7 @@ function makeFiltersHash(input: object) {
 }
 
 function cleanText(text = "") {
-  return text
-    .replace(/http\S+/g, "")
-    .replace(/\s+/g, " ")
-    .slice(0, 400); // keep token cost low
+  return text.replace(/http\S+/g, "").replace(/\s+/g, " ").slice(0, 400);
 }
 
 function isQuestion(title = "") {
@@ -59,14 +59,13 @@ function flairScore(flair?: string) {
 
 function scorePost(post: any) {
   let score = 0;
-
   score += Math.min(post.ups || 0, 50);
   score += Math.min(post.num_comments || 0, 50);
   score += Math.min((post.selftext?.length || 0) / 50, 20);
 
-  const commentRatio = post.num_comments / Math.max(post.ups, 1);
-  if (commentRatio > 0.2) score += 10;
-  if (commentRatio > 0.5) score += 20;
+  const ratio = post.num_comments / Math.max(post.ups, 1);
+  if (ratio > 0.2) score += 10;
+  if (ratio > 0.5) score += 20;
 
   if (isQuestion(post.title)) score += 15;
   score += flairScore(post.link_flair_text);
@@ -87,14 +86,27 @@ function isHighSignal(post: any) {
   );
 }
 
-/* ================= REDDIT FETCH ================= */
-async function fetchBatch(url: string) {
-  const res = await fetch(url, {
-    headers: { "User-Agent": "reddit-signal/1.0" },
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error("Reddit fetch failed");
-  return res.json();
+/* ================= REDDIT (AXIOS) ================= */
+async function fetchBatch(url: string, retries = 2) {
+  try {
+    const res = await axios.get(url, {
+      headers: REDDIT_HEADERS,
+      timeout: 8000,
+      maxRedirects: 5,
+    });
+    return res.data;
+  } catch (err: any) {
+    const status = err?.response?.status;
+
+    log("Reddit fetch error", status || err.message);
+
+    if (status === 429 && retries > 0) {
+      await new Promise(r => setTimeout(r, 1000));
+      return fetchBatch(url, retries - 1);
+    }
+
+    throw new Error("Reddit fetch failed");
+  }
 }
 
 async function fetchSubredditBatch(
@@ -104,7 +116,7 @@ async function fetchSubredditBatch(
   after: string | null
 ) {
   const url = new URL(
-    `https://www.reddit.com/r/${subreddit}/${sort}.json`
+    `https://old.reddit.com/r/${subreddit}/${sort}.json`
   );
   url.searchParams.set("limit", BATCH_SIZE.toString());
   url.searchParams.set("t", timeRange);
@@ -117,12 +129,9 @@ async function fetchSubredditBatch(
   };
 }
 
-/* ================= TOON PARSER (ROBUST) ================= */
+/* ================= TOON PARSER ================= */
 function parseTOON(toon: string) {
-  const lines = toon
-    .split("\n")
-    .map(l => l.trim())
-    .filter(Boolean);
+  const lines = toon.split("\n").map(l => l.trim()).filter(Boolean);
 
   const result = {
     pain_points: [] as string[],
@@ -136,31 +145,27 @@ function parseTOON(toon: string) {
     const lower = line.toLowerCase();
 
     if (lower.startsWith("pain_points")) {
-      const text = line.replace(/^pain_points\[\]\s*/i, "").trim();
-      if (text.length > 5) result.pain_points.push(text);
       section = "pain";
+      const t = line.replace(/^pain_points\[\]\s*/i, "").trim();
+      if (t.length > 5) result.pain_points.push(t);
       continue;
     }
 
     if (lower.startsWith("scam_signals")) {
-      const text = line.replace(/^scam_signals\[\]\s*/i, "").trim();
-      if (text.length > 5) result.scam_signals.push(text);
       section = "scam";
+      const t = line.replace(/^scam_signals\[\]\s*/i, "").trim();
+      if (t.length > 5) result.scam_signals.push(t);
       continue;
     }
 
     if (lower.startsWith("opportunit")) {
-      const text = line.replace(/^opportunities\[\]\s*/i, "").trim();
-      if (text.length > 5) result.market_opportunities.push(text);
       section = "opp";
+      const t = line.replace(/^opportunities\[\]\s*/i, "").trim();
+      if (t.length > 5) result.market_opportunities.push(t);
       continue;
     }
 
-    const cleaned = line
-      .replace(/^[-•*]/, "")
-      .replace(/^(label|pattern|market_type)\s*[:=\-]?\s*/i, "")
-      .trim();
-
+    const cleaned = line.replace(/^[-•*]/, "").trim();
     if (cleaned.length < 8) continue;
 
     if (section === "pain") result.pain_points.push(cleaned);
@@ -174,13 +179,8 @@ function parseTOON(toon: string) {
 /* ================= POST API ================= */
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const {
-      subreddit,
-      sort = "top",
-      timeRange = "week",
-      limit = 20,
-    } = body;
+    const { subreddit, sort = "top", timeRange = "week", limit = 20 } =
+      await req.json();
 
     log("REQUEST", { subreddit, sort, timeRange, limit });
 
@@ -197,7 +197,7 @@ export async function POST(req: NextRequest) {
       limit,
     });
 
-    /* ================= CACHE CHECK ================= */
+    /* ===== CACHE ===== */
     const { data: cached } = await supabase
       .from("subreddit_reports")
       .select("id, report_json, total_views")
@@ -207,35 +207,37 @@ export async function POST(req: NextRequest) {
       .maybeSingle();
 
     if (cached) {
-      log("CACHE HIT", cached.id);
-
+      log("CACHE HIT");
       await supabase
         .from("subreddit_reports")
         .update({ total_views: (cached.total_views || 0) + 1 })
         .eq("id", cached.id);
 
-      return NextResponse.json({
-        cached: true,
-        report: cached.report_json,
-      });
+      return NextResponse.json({ cached: true, report: cached.report_json });
     }
 
-    /* ================= REDDIT COLLECTION ================= */
+    /* ===== REDDIT COLLECTION ===== */
     let collected: any[] = [];
     let after: string | null = null;
-    let seen = new Set<string>();
     let batches = 0;
+    const seen = new Set<string>();
 
     while (collected.length < limit && batches < MAX_BATCHES) {
-      log("Fetching batch", batches + 1);
-      const batch = await fetchSubredditBatch(subreddit, sort, timeRange, after);
-      after = batch.after;
       batches++;
+      log("Fetching batch", batches);
+
+      const batch = await fetchSubredditBatch(
+        subreddit,
+        sort,
+        timeRange,
+        after
+      );
+      after = batch.after;
 
       for (const p of batch.posts) {
         if (!isHighSignal(p)) continue;
 
-        const key = (p.title + p.selftext).toLowerCase().slice(0, 120);
+        const key = (p.title + p.selftext).slice(0, 120).toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
 
@@ -254,7 +256,7 @@ export async function POST(req: NextRequest) {
 
     log("Selected posts", selected.length);
 
-    /* ================= AI ================= */
+    /* ===== AI ===== */
     const prompt = `
 You are a market signal extractor.
 
@@ -275,24 +277,16 @@ POSTS:
 ${selected.map((p, i) => `POST ${i + 1}\n${p.text}`).join("\n")}
 `;
 
-    log("AI PROMPT TOKENS ~", Math.round(prompt.length / 4));
-
     const completion = await openai.chat.completions.create({
       model: "gpt-5-mini",
       messages: [{ role: "user", content: prompt }],
+      temperature: 0,
     });
 
-    const rawTOON = completion.choices[0].message.content || "";
-    log("RAW TOON", rawTOON);
+    const parsed = parseTOON(
+      completion.choices[0].message.content || ""
+    );
 
-    const parsed = parseTOON(rawTOON);
-    log("PARSED RESULT", {
-      pain: parsed.pain_points.length,
-      scam: parsed.scam_signals.length,
-      opp: parsed.market_opportunities.length,
-    });
-
-    /* ================= SAVE CACHE ================= */
     const reportPayload = {
       pain_points: parsed.pain_points,
       scam_signals: parsed.scam_signals,
@@ -310,8 +304,6 @@ ${selected.map((p, i) => `POST ${i + 1}\n${p.text}`).join("\n")}
       report_json: reportPayload,
       ai_used: true,
     });
-
-    log("CACHE SAVED");
 
     return NextResponse.json({
       cached: false,
