@@ -106,7 +106,7 @@ async function fetchRedditBatch({
 
   const res = await fetch(url.toString(), {
     headers: {
-      "User-Agent": "web:RedditSignal:v1.0 (by u/Just-Ad3390)",
+      "User-Agent": "redditSignal/1.0",
       Accept: "application/json",
     },
     redirect: "manual",
