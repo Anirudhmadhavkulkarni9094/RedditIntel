@@ -2,7 +2,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import crypto from "crypto";
-import axios from "axios";
 import { supabase } from "@/lib/supabase";
 
 export const runtime = "nodejs";
@@ -15,12 +14,6 @@ const PROMPT_VERSION = "v1";
 const DEBUG = process.env.NODE_ENV !== "production";
 
 const HIGH_SIGNAL_FLAIRS = ["Hiring", "Question", "Discussion", "Advice"];
-
-const REDDIT_HEADERS = {
-  "User-Agent":
-    "web:RedditSignal:v1.0 (contact: support@redditsignal.com)",
-  Accept: "application/json",
-};
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
@@ -59,6 +52,7 @@ function flairScore(flair?: string) {
 
 function scorePost(post: any) {
   let score = 0;
+
   score += Math.min(post.ups || 0, 50);
   score += Math.min(post.num_comments || 0, 50);
   score += Math.min((post.selftext?.length || 0) / 50, 20);
@@ -72,6 +66,7 @@ function scorePost(post: any) {
 
   const ageHours =
     (Date.now() / 1000 - post.created_utc) / 3600;
+
   if (ageHours < 72) score += 15;
   else if (ageHours < 168) score += 5;
 
@@ -86,46 +81,52 @@ function isHighSignal(post: any) {
   );
 }
 
-/* ================= REDDIT (AXIOS) ================= */
-async function fetchBatch(url: string, retries = 2) {
-  try {
-    const res = await axios.get(url, {
-      headers: REDDIT_HEADERS,
-      timeout: 8000,
-      maxRedirects: 5,
-    });
-    return res.data;
-  } catch (err: any) {
-    const status = err?.response?.status;
-
-    log("Reddit fetch error", status || err.message);
-
-    if (status === 429 && retries > 0) {
-      await new Promise(r => setTimeout(r, 1000));
-      return fetchBatch(url, retries - 1);
-    }
-
-    throw new Error("Reddit fetch failed");
-  }
-}
-
-async function fetchSubredditBatch(
-  subreddit: string,
-  sort: string,
-  timeRange: string,
-  after: string | null
-) {
+/* ================= REDDIT FETCH (NATIVE FETCH) ================= */
+async function fetchRedditBatch({
+  subreddit,
+  sort,
+  timeRange,
+  limit,
+  after,
+}: {
+  subreddit: string;
+  sort: string;
+  timeRange: string;
+  limit: number;
+  after?: string | null;
+}) {
   const url = new URL(
-    `https://old.reddit.com/r/${subreddit}/${sort}.json`
+    `https://www.reddit.com/r/${subreddit}/${sort}.json`
   );
-  url.searchParams.set("limit", BATCH_SIZE.toString());
+
   url.searchParams.set("t", timeRange);
+  url.searchParams.set("limit", limit.toString());
+  url.searchParams.set("raw_json", "1");
   if (after) url.searchParams.set("after", after);
 
-  const json = await fetchBatch(url.toString());
+  const res = await fetch(url.toString(), {
+    headers: {
+      "User-Agent": "web:RedditSignal:v1.0 (by u/Just-Ad3390)",
+      Accept: "application/json",
+    },
+    redirect: "manual",
+    cache: "no-store",
+  });
+
+  if (res.status === 429) {
+    throw new Error("Reddit rate limited");
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Reddit fetch failed ${res.status}: ${text}`);
+  }
+
+  const json = await res.json();
+
   return {
     posts: json.data.children.map((c: any) => c.data),
-    after: json.data.after,
+    after: json.data.after as string | null,
   };
 }
 
@@ -146,22 +147,16 @@ function parseTOON(toon: string) {
 
     if (lower.startsWith("pain_points")) {
       section = "pain";
-      const t = line.replace(/^pain_points\[\]\s*/i, "").trim();
-      if (t.length > 5) result.pain_points.push(t);
       continue;
     }
 
     if (lower.startsWith("scam_signals")) {
       section = "scam";
-      const t = line.replace(/^scam_signals\[\]\s*/i, "").trim();
-      if (t.length > 5) result.scam_signals.push(t);
       continue;
     }
 
     if (lower.startsWith("opportunit")) {
       section = "opp";
-      const t = line.replace(/^opportunities\[\]\s*/i, "").trim();
-      if (t.length > 5) result.market_opportunities.push(t);
       continue;
     }
 
@@ -184,11 +179,19 @@ export async function POST(req: NextRequest) {
 
     log("REQUEST", { subreddit, sort, timeRange, limit });
 
-    if (!subreddit)
-      return NextResponse.json({ error: "subreddit required" }, { status: 400 });
+    if (!subreddit) {
+      return NextResponse.json(
+        { error: "subreddit required" },
+        { status: 400 }
+      );
+    }
 
-    if (!ALLOWED_LIMITS.includes(limit))
-      return NextResponse.json({ error: "Invalid limit" }, { status: 400 });
+    if (!ALLOWED_LIMITS.includes(limit)) {
+      return NextResponse.json(
+        { error: "Invalid limit" },
+        { status: 400 }
+      );
+    }
 
     const filtersHash = makeFiltersHash({
       subreddit,
@@ -208,12 +211,18 @@ export async function POST(req: NextRequest) {
 
     if (cached) {
       log("CACHE HIT");
+
       await supabase
         .from("subreddit_reports")
-        .update({ total_views: (cached.total_views || 0) + 1 })
+        .update({
+          total_views: (cached.total_views || 0) + 1,
+        })
         .eq("id", cached.id);
 
-      return NextResponse.json({ cached: true, report: cached.report_json });
+      return NextResponse.json({
+        cached: true,
+        report: cached.report_json,
+      });
     }
 
     /* ===== REDDIT COLLECTION ===== */
@@ -226,18 +235,23 @@ export async function POST(req: NextRequest) {
       batches++;
       log("Fetching batch", batches);
 
-      const batch = await fetchSubredditBatch(
+      const batch = await fetchRedditBatch({
         subreddit,
         sort,
         timeRange,
-        after
-      );
+        limit: BATCH_SIZE,
+        after,
+      });
+
       after = batch.after;
 
       for (const p of batch.posts) {
         if (!isHighSignal(p)) continue;
 
-        const key = (p.title + p.selftext).slice(0, 120).toLowerCase();
+        const key = (p.title + p.selftext)
+          .slice(0, 120)
+          .toLowerCase();
+
         if (seen.has(key)) continue;
         seen.add(key);
 
@@ -253,6 +267,13 @@ export async function POST(req: NextRequest) {
     const selected = collected
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+
+    if (selected.length < Math.min(5, limit)) {
+      return NextResponse.json(
+        { error: "Not enough Reddit data" },
+        { status: 422 }
+      );
+    }
 
     log("Selected posts", selected.length);
 
@@ -280,7 +301,6 @@ ${selected.map((p, i) => `POST ${i + 1}\n${p.text}`).join("\n")}
     const completion = await openai.chat.completions.create({
       model: "gpt-5-mini",
       messages: [{ role: "user", content: prompt }],
-      temperature: 0,
     });
 
     const parsed = parseTOON(
@@ -312,6 +332,9 @@ ${selected.map((p, i) => `POST ${i + 1}\n${p.text}`).join("\n")}
     });
   } catch (err) {
     console.error(err);
-    return NextResponse.json({ error: "Internal error" }, { status: 500 });
+    return NextResponse.json(
+      { error: "Internal error" },
+      { status: 500 }
+    );
   }
 }
