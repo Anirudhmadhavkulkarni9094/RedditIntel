@@ -12,7 +12,8 @@ export async function fetchRedditPosts({
   const url = `https://www.reddit.com/r/${subreddit}/${sort}.json?t=${timeRange}&limit=${limit}`;
 
   const res = await fetch(url, {
-    headers: { "User-Agent": "redditSignal/1.0" },
+    headers: { "User-Agent": "web:RedditSignal:v1.0 (by u/Just-Ad3390)"
+},
     cache: "no-store",
   });
 
